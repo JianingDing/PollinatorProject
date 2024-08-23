@@ -1,0 +1,651 @@
+---
+title: "Predict Climate Impact on Pollinators"
+author: "Jianing Ding"
+date: "2024-06-30"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(knitr)
+library(raster)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(rworldmap) 
+library(rworldxtra)
+library(lme4)
+library(cowplot)
+library(viridis)
+library(ncdf4)
+library(nlme)
+library(MuMIn)
+library(sf)
+
+# read in the original predicts database 
+PREDICTS <- readRDS("C:\\Users\\dingj\\Desktop\\project\\predict data_use\\PREDICTS_pollinators_8_exp.rds") %>%
+  mutate(COL_ID = as.character(COL_ID))
+
+
+# source in additional functions
+source("00_functions.R")
+source("CorrectSamplingEffort.R")
+source("SiteMetrics.R")
+source("MergeSites.R")
+source("ReadPREDICTS.R")
+
+```
+
+\#**Define Predict Continuous Function**
+
+```{r function Continuous, echo=TRUE}
+# function for predicting continuous variable
+predict_continuous <- function(model,
+                               model_data, 
+                               response_variable,
+                               categorical_variable,
+                               continuous_variable,
+                               continuous_transformation,
+                               random_variable,
+                               colour_palette) {
+  
+  # Set up the prediction dataframe with necessary variables
+  prediction_data <- model_data[, c(response_variable, random_variable, categorical_variable, continuous_variable)]
+  
+  # Remove any incomplete rows (NAs) from the prediction data
+  prediction_data <- prediction_data[complete.cases(prediction_data),]
+  
+  # Ensure all factor levels are the same as in the model for both categorical and random variables
+  factor_vars <- c(categorical_variable, random_variable)
+  for (var in factor_vars) {
+    if (is.factor(prediction_data[[var]])) {
+      levels_model <- if (inherits(model, "lme")) {
+        levels(model_data[[var]])
+      } else {
+        levels(model@frame[[var]])
+      }
+      if (!all(levels(prediction_data[[var]]) %in% levels_model)) {
+        prediction_data[[var]] <- factor(prediction_data[[var]], levels = levels_model)
+      }
+    }
+  }
+  
+  # Predict the values for the model using synchronized data
+  y_values <- tryCatch({
+    if (inherits(model, "lme")) {
+      # For lme model
+      predict(model, newdata = prediction_data, level = 0)
+    } else {
+      # For lmer model
+      StatisticalModels::PredictGLMER(model, data = prediction_data, se.fit = TRUE, seMultiplier = 1.96)
+    }
+  }, error = function(e) {
+    print(paste("Error during prediction for variable", var, ":", e$message))
+    NULL
+  })
+  
+  # Check if prediction was successful
+  if (is.null(y_values)) {
+    print("Prediction failed, skipping to next iteration")
+    return(NULL)  # Return NULL to indicate failure
+  }
+  
+  # Extract predicted values and calculate standard errors if necessary
+  if (inherits(model, "lme")) {
+    y_value <- y_values
+    # Manually compute standard errors
+    X <- model.matrix(formula(model), prediction_data)
+    beta <- fixef(model)
+    se.fit <- sqrt(rowSums((X %*% vcov(model)) * X))
+    y_value_plus <- y_value + 1.96 * se.fit
+    y_value_minus <- y_value - 1.96 * se.fit
+  } else {
+    y_value <- y_values[[1]]
+    y_value_plus <- y_values[[2]]
+    y_value_minus <- y_values[[3]]
+  }
+  
+  # Bind the predicted values to the prediction data
+  bound_values <- data.frame(cbind(prediction_data,
+                                   y_value, 
+                                   y_value_plus, 
+                                   y_value_minus, 
+                                   metric = response_variable,
+                                   prediction_data[, continuous_variable]))
+  
+  # Rename columns
+  colnames(bound_values)[ncol(bound_values)] <- paste(continuous_variable, "transform", sep = "_")
+  bound_values <- dplyr::rename(bound_values, "response_variable" = all_of(response_variable))
+  
+  # Print the final dataframe of predicted values
+  print(bound_values)
+  
+  # Debugging information
+  print("Columns in bound_values:")
+  print(colnames(bound_values))
+  print("Number of columns in bound_values:")
+  print(ncol(bound_values))
+  
+  return(bound_values)  # Ensure the function returns the result
+}
+
+
+```
+
+\#**Define Calculate Baseline Function**
+
+```{r Baseline Function, echo=TRUE}
+# Function to calculate baseline (mean and sd)
+calc_baseline <- function(data_file, func, pred_points, pred_points_sp){
+  
+  # Calculate either the mean or standard error for baseline, then extract points for predicts sites
+  data_fin <- calc(data_file, func) %>%
+    extract(pred_points_sp)
+  
+  # Bind the extracted values back onto the predicts coordinates
+  data_fin <- data.frame(pred_points[,1:3 ], data_fin)
+  
+  return(data_fin)
+}
+
+```
+
+\#**Load Climate Data**
+
+```{r Load climate data, echo=TRUE}
+# Load in the mean temperature data from CRU
+tmp <- raster::stack("C:\\Users\\dingj\\Desktop\\project\\climate data\\cru_ts4.03.1901.2018.tmp.dat.nc", varname="tmp")
+
+```
+
+\#**Filter Pollinators Data**
+
+```{r filter data, echo=TRUE}
+# Read in the predicts pollinators
+PREDICTS_pollinators_orig <- readRDS("C:\\Users\\dingj\\Desktop\\project\\predict data_use\\PREDICTS_pollinators_8_exp.rds") %>%
+  dplyr::select(-clade_rank, -confidence)  %>%
+  filter(Class == "Insecta") %>%
+  filter(Order != "Thysanoptera") %>%
+  dplyr::filter(Predominant_land_use %in% c("Cropland", "Primary vegetation")) %>%
+  droplevels()
+
+# set up vector for taxonomic orders
+taxonomic_orders <- c("Lepidoptera","Coleoptera", "Diptera", "Hymenoptera")
+PREDICTS_pollinators_taxa <- list()
+
+# loop through the taxonomic orders and remove each for jack-knife with replacement/select one for single order models
+for(i in 1:length(taxonomic_orders)){
+  PREDICTS_pollinators_taxa[[i]] <- PREDICTS_pollinators_orig %>% 
+    filter(Order == taxonomic_orders[i]) %>% # amend to either jack-knife or select one order
+    droplevels()
+}
+
+# bind together the two dataframes
+pollinat_bound <- list(PREDICTS_pollinators_taxa[[1]], 
+                       PREDICTS_pollinators_taxa[[2]], 
+                       PREDICTS_pollinators_taxa[[3]],
+                       PREDICTS_pollinators_taxa[[4]])
+# 创建一个数据框，记录每个分类的计数
+order_counts <- sapply(PREDICTS_pollinators_taxa, nrow)
+order_counts_df <- data.frame(Order = taxonomic_orders, Counts = order_counts)
+
+# 制作柱状图并注明每个条形的数目
+ggplot(order_counts_df, aes(x = Order, y = Counts, fill = Order)) +
+  geom_bar(stat = "identity", width = 0.5) +  # 修改条形的宽度为0.7
+  geom_text(aes(label = Counts), vjust = -0.3, size = 4) +
+  scale_fill_manual(values = c("#768CEE", "#C3D6F2", "#D1EAF5", "#E1F7E7")) +   coord_cartesian(ylim = c(0, 80000)) +  # 设置y轴的范围
+  theme_minimal() +
+  labs(title = "Count of each taxonomic group",
+       x = "Taxonomic groups",
+       y = "Pollinator abundance",
+       fill = "Taxonomic groups")
+
+ggsave("count.png", plot = last_plot(), width = 10, height = 8, units = "in")
+
+```
+
+\#**Setup List**
+
+```{r setup list, echo=TRUE}
+# Set up vector for filtering for vertebrates and invertebrates
+predict_climate_list <- list()
+
+
+```
+
+\#**Loop Through Phylum**
+
+```{r loopOne, echo=TRUE}
+
+  # loop through each phylum
+for(j in 1:length(pollinat_bound)){
+  
+  # PREDICTS data compilation
+  # filter for main pollinating taxa
+  PREDICTS_pollinators <- pollinat_bound[[j]]
+  
+  # correct for sampling effort
+  PREDICTS_pollinators <- predictsFunctions::CorrectSamplingEffort(PREDICTS_pollinators)
+  
+  # calculate site metrics including all species (confirmed and not confirmed pollinator)
+  order.sites.div <- SiteMetrics(diversity = PREDICTS_pollinators,
+                                 extra.cols = c("SSB", "SSBS", "Predominant_land_use", "UN_region", "Pollinating"),
+                                 #sites.are.unique = TRUE,
+                                 srEstimators = TRUE)
+  
+  # set id column for merging back into correct place
+  order.sites.div$id_col <- 1:nrow(order.sites.div)
+  
+  # PREDICTS sites with the month of the recording
+  PRED_sites <- order.sites.div %>% select(id_col, Latitude, Longitude, Sample_end_latest) %>%
+    mutate(Sample_end_latest = paste("X", substr(Sample_end_latest, start = 1, stop = 7), sep = "")) %>%
+    mutate(Sample_end_latest = gsub("-", ".", Sample_end_latest)) %>%
+    filter(!is.na(Latitude))
+  
+  # calculate the means and standard deviation for the beginning of the series
+  # take names of values for 1901 to 1930
+  tmp1901_1930 <- tmp[[names(tmp)[1:360]]]
+  
+  # extract the points for each the predicts coordinates
+  PRED_sites_sp <- PRED_sites %>%
+    select(Longitude, Latitude) %>%
+    filter(!is.na(Latitude)) %>%
+    SpatialPoints()
+  
+  # calculate the mean baseline, and convert to character for merging
+  climate_start_mean <- calc_baseline(tmp1901_1930, 
+                                      func = mean, 
+                                      pred_points = PRED_sites, 
+                                      pred_points_sp = PRED_sites_sp) %>%
+    mutate(Latitude = as.character(Latitude)) %>%
+    mutate(Longitude = as.character(Longitude))
+  
+  # calculate the sd baseline, and convert to character for merging
+  climate_start_sd <- calc_baseline(tmp1901_1930, 
+                                    func = stats::sd, 
+                                    pred_points = PRED_sites, 
+                                    pred_points_sp = PRED_sites_sp) %>%
+    mutate(Latitude = as.character(Latitude)) %>%
+    mutate(Longitude = as.character(Longitude))
+  
+  # calculate the mean temperatures for each predicts site, 11 months previously
+  # set up empty list for each dataframe
+  raster_means <- list()
+  
+  # time the length of the loop over each unique date in predicts sites
+  system.time(
+    # for each unique site month, select the pixels for that date, and 11 months previously, and then convert each raster set to a dataframe
+    for(i in 1:length(unique(PRED_sites$Sample_end_latest))){
+      
+      # create unique list of the end dates for the predicts sites
+      pred_dates <- unique(PRED_sites$Sample_end_latest)
+      
+      # select the raster pixels for the end date of the predicts site, and then the index of that name
+      date_raster <- grepl(pred_dates[i], names(tmp))
+      site_index <- which(date_raster == TRUE)
+      
+      # select the previous 11 indices - i.e. 11 months previous worth of pixels
+      ind_raster <- tmp[[names(tmp)[(site_index - 11): site_index]]]
+      
+      # filter the raster for only coordinates we have PREDICTS sites for that date
+      PRED_sites_filt <- PRED_sites %>%
+        filter(Sample_end_latest == pred_dates[i]) %>%
+        select(Longitude, Latitude) %>%
+        SpatialPoints()
+      
+      # identify site ids for merging
+      site_ids <- PRED_sites %>%
+        filter(Sample_end_latest == pred_dates[i]) %>%
+        select(id_col, Longitude, Latitude)
+      
+      # filter the raster for that date for the locations we have predicts sites
+      PRED_coords <- cbind(site_ids, extract(ind_raster, PRED_sites_filt, na.rm = FALSE))
+      
+      # convert that set of dates to a dataframe
+      ind_raster_frame <- as.data.frame(PRED_coords)
+      
+      # remove the extra coordinate columns for calculating the row means
+      ind_raster_values <- ind_raster_frame %>% select(-id_col, -Longitude, -Latitude)
+      
+      # calculate the mean values for each coordinate and bind back onto the coordinates
+      raster_means[[i]] <- cbind(names(tmp)[site_index], (ind_raster_frame %>% select(id_col, Longitude, Latitude)), rowMeans(ind_raster_values))
+      colnames(raster_means[[i]]) <- c("end_date", "id_col", "x", "y", "mean_value")
+      
+      # print the iteration number
+      print(i)
+    }
+  )
+  
+  ## adjust the mean value for each site for the baseline at that site
+  # first, merge the baseline sd and mean by coordinate for each site
+  adjusted_climate <- rbindlist(raster_means) %>%
+    select(-end_date) %>%
+    unique() %>%
+    inner_join(climate_start_mean, by = "id_col") %>%
+    rename("mean_base" = "data_fin") %>%
+    inner_join(climate_start_sd, by = "id_col") %>%
+    rename("sd_base" = "data_fin") %>%
+    mutate(anomaly = mean_value - mean_base) %>%
+    mutate(standard_anom = anomaly / sd_base)
+  
+  # bind the adjusted climate data back onto the predicts sites
+  predicts_climate <- inner_join(order.sites.div, adjusted_climate, by = "id_col")
+  
+  # add 1 for abundance and simpson diversity
+  predicts_climate$Total_abundance <- predicts_climate$Total_abundance + 1
+  predicts_climate$Simpson_diversity <- predicts_climate$Simpson_diversity + 1
+  
+  predicts_climate_sf <- st_as_sf(predicts_climate, coords = c("Longitude", "Latitude"), crs = 4326, agr = "constant")
+
+  # Transform to UTM coordinates (assuming zone 60 is being used here)
+  predicts_climate_sf <- st_transform(predicts_climate_sf, crs = st_crs("+proj=utm +zone=60 +datum=WGS84 +units=m +ellps=WGS84"))
+
+  # Add the UTM coordinates back to the predicts_climate data frame
+  predicts_climate$UTM_Easting <- st_coordinates(predicts_climate_sf)[, 1]
+  predicts_climate$UTM_Northing <- st_coordinates(predicts_climate_sf)[, 2]
+  
+  
+  # assign to list of predicts_climate and insects and vertebrates
+  predict_climate_list[[j]] <- predicts_climate
+  
+}
+  
+```
+
+```{r create prediction model, echo=TRUE}
+# set up new lists for output
+model_2c_abundance <- list()
+abundance_model <- list()
+main_plot_abundance <- list()
+
+
+# run models for both species richness and total abundance
+for(m in 1:length(pollinat_bound)){
+  
+  predict_climate_list[[m]]<-predict_climate_list[[m]]%>%filter(!is.na(Total_abundance))%>%  filter (!is.na(standard_anom))%>%droplevels()
+
+  
+  # species richness, standard anom as a factor
+  model_2c_abundance[[m]] <- lmerTest::lmer(log(Total_abundance) ~ standard_anom * Predominant_land_use + (1|SS), data = predict_climate_list[[m]]) 
+  print(AIC(model_2c_abundance[[m]]))
+  # 
+  model_2c_abundance[[m]] <- lmerTest::lmer(log(Total_abundance) ~ standard_anom * Predominant_land_use + (1|SS) + (1|SSB), data = predict_climate_list[[m]])
+  print(AIC(model_2c_abundance[[m]]))
+  
+  # run predictions for the model of standard anomaly
+  abundance_model[[m]] <- predict_continuous(model = model_2c_abundance[[m]],
+                                             model_data = predict_climate_list[[m]],
+                                             response_variable = "Total_abundance",
+                                             categorical_variable = c("Predominant_land_use"),
+                                             continuous_variable = c("standard_anom"),
+                                             continuous_transformation = "",
+                                             random_variable = c("SS", "SSB", "SSBS"))
+ 
+  
+  # plot for standardised anomaly and land-use for abundance
+  main_plot_abundance[[m]] <- ggplot(abundance_model[[m]]) +
+    geom_line(aes(x = standard_anom, y = y_value, colour = Predominant_land_use), size = 1.5) +
+    geom_ribbon(aes(x = standard_anom, y = y_value, fill = Predominant_land_use, ymin = y_value_minus, ymax = y_value_plus), alpha = 0.4) +
+    scale_fill_manual("Land-use type", values = c("#009E73", "#E69F00")) +
+    scale_colour_manual("Land-use type", values = c("#009E73", "#E69F00")) +
+    xlab("Standardised temperature anomaly") +
+    ylab("Total abundance") +
+    theme_bw() +
+    theme(panel.grid = element_blank())
+  
+
+}
+
+print(main_plot_abundance[[1]])
+print(main_plot_abundance[[2]])
+print(main_plot_abundance[[3]])
+print(main_plot_abundance[[4]])
+
+
+
+```
+
+```{r plot prediction model, echo=TRUE}
+# plot for the pollinating insects and non-pollinating insects - climate anomaly of 4 corresponds to ~100% abundance loss
+plot_grid(main_plot_abundance[[1]] +
+            ggtitle("Pollinating insects (Lepidoptera)") + 
+            xlim(-0.25, 3.5) +
+            scale_y_continuous(limits = c(-6, 8.5), breaks = c(-4.628887, -3.2425924, -1.856298, -0.4700036, 0.9162907, 2.302585, 3.6888795, 5.075174, 6.461468), labels = c(0.01, 0.04, 0.156, 0.625, 2.5, 10, 40,  160, 640)) +
+            theme(legend.position = "none"), main_plot_abundance[[2]] + 
+            xlim(-0.25, 3.5) +
+            ggtitle("Pollinating insects (Coleoptera)") +
+            scale_y_continuous(limits = c(-6, 8.5), breaks = c(-4.628887, -3.2425924, -1.856298, -0.4700036, 0.9162907, 2.302585, 3.6888795, 5.075174, 6.461468), labels = c(0.01, 0.04, 0.156, 0.625, 2.5, 10, 40,  160, 640)) +
+            theme(legend.position = "none"), main_plot_abundance[[3]] + 
+            xlim(-0.25, 3.5) +
+            ggtitle("Pollinating insects (Diptera)") +
+            scale_y_continuous(limits = c(-6, 8.5), breaks = c(-4.628887, -3.2425924, -1.856298, -0.4700036, 0.9162907, 2.302585, 3.6888795, 5.075174, 6.461468), labels = c(0.01, 0.04, 0.156, 0.625, 2.5, 10, 40,  160, 640)) +
+            theme(legend.position = "none"), main_plot_abundance[[4]] + 
+            xlim(-0.25, 3.5) +
+            ggtitle("Pollinating insects (Hymenoptera)") +
+            scale_y_continuous(limits = c(-6, 8.5), breaks = c(-4.628887, -3.2425924, -1.856298, -0.4700036, 0.9162907, 2.302585, 3.6888795, 5.075174, 6.461468), labels = c(0.01, 0.04, 0.156, 0.625, 2.5, 10, 40,  160, 640)) +
+            theme(legend.position = "none"), ncol = 2)
+
+```
+
+```{r pcreate prediction model with spatial structure, echo=TRUE, results='hide'}
+
+data_spatial<-list()
+model_exponential_random<-list()
+abundance_model_exponential<-list()
+main_plot_spatial_abundance<-list()
+
+for(m in 1:length(pollinat_bound)){
+ set.seed(123)
+
+predict_climate_list[[m]]$UTM_Easting <- jitter(predict_climate_list[[m]]$UTM_Easting, factor = 1e-5)
+predict_climate_list[[m]]$UTM_Northing <- jitter(predict_climate_list[[m]]$UTM_Northing, factor = 1e-5)
+ 
+    data_spatial[[m]] <- predict_climate_list[[m]]
+    
+}
+
+
+
+# run models for both species richness and total abundance
+for(m in 1:length(pollinat_bound)) {
+  # 过滤缺失值
+  predict_climate_list[[m]] <- predict_climate_list[[m]] %>%
+    filter(!is.na(Total_abundance)) %>%
+    filter(!is.na(standard_anom)) %>%
+    droplevels()
+
+  # 拟合模型
+  model_exponential_random[[m]] <- lme(
+    log(Total_abundance) ~ standard_anom * Predominant_land_use,
+    random = list(SS = ~ 1, SSB = ~ 1),
+    data = data_spatial[[m]],
+    correlation = corExp(form = ~ UTM_Easting + UTM_Northing)
+  )
+
+  
+  # 运行预测
+  abundance_model_exponential[[m]] <- predict_continuous(
+    model = model_exponential_random[[m]],
+    model_data = data_spatial[[m]],
+    response_variable = "Total_abundance",
+    categorical_variable = c("Predominant_land_use"),
+    continuous_variable = c("standard_anom"),
+    continuous_transformation = "",
+    random_variable = c("SS", "SSB", "SSBS")
+  )
+
+
+  # 绘制标准化异常值和土地使用类型的丰度图
+  main_plot_spatial_abundance[[m]] <- ggplot(abundance_model_exponential[[m]]) +
+    geom_line(aes(x = standard_anom, y = y_value, colour = Predominant_land_use), size = 1.5) +
+    geom_ribbon(aes(x = standard_anom, y = y_value, fill = Predominant_land_use, ymin = y_value_minus, ymax = y_value_plus), alpha = 0.4) +
+    scale_fill_manual("Land-use type", values = c("#009E73", "#E69F00")) +
+    scale_colour_manual("Land-use type", values = c("#009E73", "#E69F00")) +
+    xlab("Standardised temperature anomaly") +
+    ylab("Total abundance") +
+    theme_bw() +
+    theme(panel.grid = element_blank())
+}
+
+
+print(main_plot_spatial_abundance[[1]])
+print(main_plot_spatial_abundance[[2]])
+print(main_plot_spatial_abundance[[3]])
+print(main_plot_spatial_abundance[[4]])
+
+```
+
+```{r plot prediction model with spatial structure, echo=TRUE}
+
+plot_grid(main_plot_spatial_abundance[[1]] +
+            ggtitle("Pollinating insects (Lepidoptera)") + 
+            xlim(-0.25, 3.5) +
+            scale_y_continuous(limits = c(-6, 8.5), breaks = c(-4.628887, -3.2425924, -1.856298, -0.4700036, 0.9162907, 2.302585, 3.6888795, 5.075174, 6.461468), labels = c(0.01, 0.04, 0.156, 0.625, 2.5, 10, 40,  160, 640)) +
+            theme(legend.position = "none"), main_plot_spatial_abundance[[2]] + 
+            xlim(-0.25, 3.5) +
+            ggtitle("Pollinating insects (Coleoptera)") +
+            scale_y_continuous(limits = c(-6, 8.5), breaks = c(-4.628887, -3.2425924, -1.856298, -0.4700036, 0.9162907, 2.302585, 3.6888795, 5.075174, 6.461468), labels = c(0.01, 0.04, 0.156, 0.625, 2.5, 10, 40,  160, 640)) +
+            theme(legend.position = "none"), main_plot_spatial_abundance[[3]] + 
+            xlim(-0.25, 3.5) +
+            ggtitle("Pollinating insects (Diptera)") +
+            scale_y_continuous(limits = c(-6, 8.5), breaks = c(-4.628887, -3.2425924, -1.856298, -0.4700036, 0.9162907, 2.302585, 3.6888795, 5.075174, 6.461468), labels = c(0.01, 0.04, 0.156, 0.625, 2.5, 10, 40,  160, 640)) +
+            theme(legend.position = "none"), main_plot_spatial_abundance[[4]] + 
+            xlim(-0.25, 3.5) +
+            ggtitle("Pollinating insects (Hymenoptera)") +
+            scale_y_continuous(limits = c(-6, 8.5), breaks = c(-4.628887, -3.2425924, -1.856298, -0.4700036, 0.9162907, 2.302585, 3.6888795, 5.075174, 6.461468), labels = c(0.01, 0.04, 0.156, 0.625, 2.5, 10, 40,  160, 640)) +
+            theme(legend.position = "none"), ncol = 2)
+
+
+```
+
+```{r plot comparison, echo=TRUE}
+compare_plot <- list()
+comparison_table <- list()
+
+
+
+
+for(m in 1:length(pollinat_bound)) {
+  
+  species_name <- taxonomic_orders[[m]]
+  
+  # 绘制比较图并存储在 compare_plot 列表中
+  compare_plot[[m]] <- plot_grid(
+    main_plot_abundance[[m]] +
+      ggtitle("Non-correlated model") + 
+      xlim(-0.25, 3.5) +
+      scale_y_continuous(
+        limits = c(-6, 8.5), 
+        breaks = c(-4.628887, -3.2425924, -1.856298, -0.4700036, 0.9162907, 2.302585, 3.6888795, 5.075174, 6.461468), 
+        labels = c(0.01, 0.04, 0.156, 0.625, 2.5, 10, 40,  160, 640)
+      ) +
+      theme(legend.position = "bottom"), 
+    main_plot_spatial_abundance[[m]] +
+      ggtitle("Spatial autocorrelaiton model") + 
+      xlim(-0.25, 3.5) +
+      scale_y_continuous(
+        limits = c(-6, 8.5), 
+        breaks = c(-4.628887, -3.2425924, -1.856298, -0.4700036, 0.9162907, 2.302585, 3.6888795, 5.075174, 6.461468), 
+        labels = c(0.01, 0.04, 0.156, 0.625, 2.5, 10, 40,  160, 640)
+      ) +
+      theme(legend.position = "bottom"), 
+    ncol = 2,
+    rel_widths = c(1, 1) 
+  )
+  
+  # 打印比较图
+  print(compare_plot[[m]])
+  file_name <- paste0("compare_plot_", species_name, ".png")
+    ggsave(file_name, plot = compare_plot[[m]], width = 12, height = 8, units = "in", dpi = 300)
+
+  # 比较 AIC 和 BIC
+  aic_model_exponential_random <- AIC(model_exponential_random[[m]])
+  aic_model_2c_abundance <- AIC(model_2c_abundance[[m]])
+  
+  bic_model_exponential_random <- BIC(model_exponential_random[[m]])
+  bic_model_2c_abundance <- BIC(model_2c_abundance[[m]])
+  
+  print(paste("AIC of model_exponential_random (", m, "): ", aic_model_exponential_random))
+  print(paste("AIC of model_2c_abundance (", m, "): ", aic_model_2c_abundance))
+  print(paste("BIC of model_exponential_random (", m, "): ", bic_model_exponential_random))
+  print(paste("BIC of model_2c_abundance (", m, "): ", bic_model_exponential_random))
+  
+  # 比较模型摘要
+  print(summary(model_exponential_random[[m]]))
+  print(summary(model_2c_abundance[[m]]))
+  
+  # 计算 R²
+  r2_model_exponential_random <- r.squaredGLMM(model_exponential_random[[m]])
+  r2_model_2c_abundance <- r.squaredGLMM(model_2c_abundance[[m]])
+  
+   comparison_table[[m]] <- data.frame(
+    Statistic = c("AIC", "BIC", "Marginal R²", "Conditional R²"),
+    Model_Exponential = c(aic_model_exponential_random, bic_model_exponential_random, r2_model_exponential_random[1], r2_model_exponential_random[2]),
+    Model_2C = c(aic_model_2c_abundance, bic_model_2c_abundance, r2_model_2c_abundance[1], r2_model_2c_abundance[2])
+  )
+  
+  print(knitr::kable(comparison_table[[m]], format = "html", caption = paste("Pollinating insects (", species_name, ")", sep = "")))
+  
+}
+print(comparison_table[[1]])
+print(comparison_table[[2]])
+print(comparison_table[[3]])
+print(comparison_table[[4]])
+
+```
+
+```{r plot combined, echo=TRUE}
+
+# Assuming you have two models: abundance_model_exponential and abundance_model
+# We'll combine the two into a single plot with four panels
+
+# Create a combined dataframe for plotting
+
+combined_plot_abundance<-list()
+
+for(m in 1:length(pollinat_bound)) {
+  
+
+  # Prepare data for plotting
+  abundance_model[[m]]$Model <- "Linear"
+  abundance_model_exponential[[m]]$Model <- "Exponential"
+  abundance_model[[m]]$ModelType <- paste(abundance_model[[m]]$Model, abundance_model[[m]]$Predominant_land_use)
+  abundance_model_exponential[[m]]$ModelType <- paste(abundance_model_exponential[[m]]$Model, abundance_model_exponential[[m]]$Predominant_land_use)
+
+  # Combine data for plotting
+  combined_data <- rbind(abundance_model[[m]], abundance_model_exponential[[m]])
+
+  # Plot combined data
+  combined_plot_abundance[[m]] <- ggplot(combined_data, aes(x = standard_anom, y = y_value, colour = ModelType)) +
+      geom_ribbon(aes(ymin = y_value_minus, ymax = y_value_plus, fill = ModelType), alpha = 0.3) +  # Confidence intervals first
+    geom_line(data = combined_data %>% filter(Model != "Exponential"), aes(colour = ModelType, linetype = Model), size = 1) +  # All linear lines
+    geom_line(data = combined_data %>% filter(Model == "Exponential"), aes(colour = ModelType, linetype = Model), size = 1.5) +  # Exponential line on top
+    scale_linetype_manual(values = c("Linear" = "solid", "Exponential" = "dashed")) +
+    scale_fill_manual(values = c("Linear Primary vegetation" = "#66c2a5",  # Light green
+                                 "Linear Cropland" = "#fc8d62",           # Light orange
+                                 "Exponential Primary vegetation" = "#8da0cb", # Light blue
+                                 "Exponential Cropland" = "#e78ac3")) +   # Light pink
+    scale_colour_manual(values = c("Linear Primary vegetation" = "#66c2a5", 
+                                   "Linear Cropland" = "#fc8d62", 
+                                   "Exponential Primary vegetation" = "black", 
+                                   "Exponential Cropland" = "black")) +
+    xlab("Standardised temperature anomaly") +
+    ylab("Total abundance") +
+    ggtitle("Combined Model Results for Total Abundance") +
+    theme_bw() +
+    theme(panel.grid = element_blank(), legend.key = element_blank()) +
+    guides(size = FALSE, linetype = guide_legend(override.aes = list(colour = "black")))
+
+
+}
+print(combined_plot_abundance[[1]])
+print(combined_plot_abundance[[2]])
+print(combined_plot_abundance[[3]])
+print(combined_plot_abundance[[4]])
+
+```
